@@ -20,7 +20,7 @@ from src.receipts_pdf import generate_all_receipts
 APP_TITLE = "Demonstrativo de Pagamento Contare"
 LOGO_PATH = str(Path(__file__).parent / "assets" / "logo.png")
 
-# Considera "zerado" para regra especial
+# Considera "zerado" para regra especial (pode ajustar no sidebar)
 DEFAULT_LIMIAR_ZERO = 1.0
 
 
@@ -98,7 +98,6 @@ def extract_verbas_8781_981_from_block(block: str) -> Tuple[Optional[float], Opt
 
     flat = block.replace("\n", " ")
 
-    # Captura o valor monetário imediatamente antes de "P" (provento) e "D" (desconto).
     re_8781 = re.compile(r"\b8781\b.*?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*P\b", re.IGNORECASE)
     re_981 = re.compile(r"\b981\b.*?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*D\b", re.IGNORECASE)
 
@@ -120,7 +119,7 @@ def extract_verbas_8781_981_from_block(block: str) -> Tuple[Optional[float], Opt
 def gpt_extract_verbas(block: str, model: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """
     Fallback GPT: extrair valores das verbas 8781 e 981 do TEXTO do bloco.
-    Usa Chat Completions com JSON mode (mais compatível no Streamlit Cloud).
+    Usa Chat Completions com JSON mode (compatível no Streamlit Cloud).
     """
     try:
         from openai import OpenAI
@@ -242,7 +241,7 @@ with col2:
     st.title(APP_TITLE)
     st.caption(
         "Regra geral: **Valor a pagar = Bruto(planilha) − Líquido(PDF)**.\n"
-        "Regra especial (casos tipo Alana): se **(Líquido ≈ 0 OU existir verba 981)** e colaborador **ATIVO**, então:\n"
+        "Regra especial (somente quando líquido ~0 e ATIVO):\n"
         "**Valor a pagar = Bruto(planilha) − verba 8781 − verba 981**"
     )
 
@@ -280,10 +279,9 @@ xlsx_path.write_bytes(xlsx_file.getbuffer())
 
 if st.button("Processar", type="primary"):
     with st.spinner("Extraindo dados do PDF..."):
-        # parser base (rápido); GPT aqui fica apenas para verbas 8781/981 se regex falhar
         extracao = parse_pdf_with_fallback(
             str(pdf_path),
-            use_gpt_fallback=False,
+            use_gpt_fallback=False,  # GPT aqui fica apenas para verbas 8781/981 se regex falhar
             openai_model=openai_model,
         )
 
@@ -347,22 +345,21 @@ if st.button("Processar", type="primary"):
 
             # --------
             # REGRA PADRÃO vs ESPECIAL
-            # gatilho especial:
-            #   - líquido <= limiar_zero OU existe verba 981
-            #   - e colaborador ATIVO
+            # ESPECIAL: SOMENTE quando líquido estiver "zerado" (<= limiar_zero) e ATIVO
             # --------
             regra_aplicada = "PADRAO: bruto_planilha - liquido_pdf"
             diferenca = None
             valor_a_pagar = None
 
             if bruto_planilha is not None and liquido_pdf is not None:
-                gatilho_especial = (liquido_pdf <= float(limiar_zero)) or (v981 is not None and v981 > 0)
+                gatilho_especial = (liquido_pdf <= float(limiar_zero))
 
                 if gatilho_especial and (is_ativo is True):
-                    regra_aplicada = "ESPECIAL: bruto_planilha - verba8781 - verba981 (liq baixo/981 presente & ATIVO)"
+                    regra_aplicada = "ESPECIAL: bruto_planilha - verba8781 - verba981 (liq ~0 & ATIVO)"
                     if v8781 is None or v981 is None:
                         status = "REVISAR" if status == "OK" else status
                         notas.append("regra especial acionada, mas 8781/981 não foram extraídas (verificar bloco/PDF).")
+                        # fallback seguro: usa regra padrão
                         diferenca = float(bruto_planilha) - float(liquido_pdf)
                         valor_a_pagar = max(diferenca, 0.0)
                     else:
