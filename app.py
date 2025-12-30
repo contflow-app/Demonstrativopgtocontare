@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import zipfile
 from pathlib import Path
-from typing import Optional, Dict, Tuple, Any, List
+from typing import Optional, Tuple, Any, List
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +19,9 @@ from src.receipts_pdf import generate_all_receipts
 
 APP_TITLE = "Demonstrativo de Pagamento Contare"
 LOGO_PATH = str(Path(__file__).parent / "assets" / "logo.png")
-EPS_ZERO = 1.0  # consideramos "zerado" <= R$ 1,00 para efeito de regra especial
+
+# Considera "zerado" para regra especial
+DEFAULT_LIMIAR_ZERO = 1.0
 
 
 # -----------------------------
@@ -65,7 +68,6 @@ def extract_full_text(pdf_path: str) -> str:
 
 
 def split_blocks(text: str) -> List[str]:
-    # mesmo marcador usado no parser: "Empr.:"
     starts = [m.start() for m in re.finditer(r"\bEmpr\.\:\s*", text, flags=re.IGNORECASE)]
     if not starts:
         return []
@@ -77,8 +79,6 @@ def split_blocks(text: str) -> List[str]:
 
 
 def find_block_by_cpf(text: str, cpf: str) -> Optional[str]:
-    if not cpf:
-        return None
     c = cpf_digits(cpf)
     if not c:
         return None
@@ -90,23 +90,20 @@ def find_block_by_cpf(text: str, cpf: str) -> Optional[str]:
 
 def extract_verbas_8781_981_from_block(block: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """
-    Extrai valores das verbas diretamente do texto do bloco:
-      - 8781 SALARIO CONTRATUAL ... 1.518,00 P
-      - 981 DESC ADIANTAMENTO SALARIAL ... 1.350,00 D
-    Retorna: (v8781, v981, evidence_str)
+    Extrai valores da 8781 (P) e 981 (D) diretamente do texto do bloco.
+    Retorna (v8781, v981, evidence_str).
     """
     if not block:
         return None, None, None
 
-    # padrões típicos vistos no extrato:
-    # 8781SALARIO CONTRATUAL. 30,00 1.518,00P
-    # 981 DESC ADIANTAMENTO SALARIAL 1.350,00 1.350,00D
-    # vamos capturar o último valor monetário antes de P/D no trecho
-    re_8781 = re.compile(r"\b8781\b.*?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*P\b", re.IGNORECASE)
-    re_981  = re.compile(r"\b981\b.*?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*D\b", re.IGNORECASE)
+    flat = block.replace("\n", " ")
 
-    m8781 = re_8781.search(block.replace("\n", " "))
-    m981 = re_981.search(block.replace("\n", " "))
+    # Captura o valor monetário imediatamente antes de "P" (provento) e "D" (desconto).
+    re_8781 = re.compile(r"\b8781\b.*?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*P\b", re.IGNORECASE)
+    re_981 = re.compile(r"\b981\b.*?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*D\b", re.IGNORECASE)
+
+    m8781 = re_8781.search(flat)
+    m981 = re_981.search(flat)
 
     v8781 = parse_brl_money(m8781.group(1)) if m8781 else None
     v981 = parse_brl_money(m981.group(1)) if m981 else None
@@ -120,21 +117,10 @@ def extract_verbas_8781_981_from_block(block: str) -> Tuple[Optional[float], Opt
     return v8781, v981, "; ".join(ev) if ev else None
 
 
-def infer_ativo_from_pdf_fields(nome: Optional[str], cargo_pdf: Optional[str]) -> Optional[bool]:
-    """
-    Se o XLSX não tiver status, inferimos pelo PDF:
-    - "Situação: Trabalhando" => ATIVO
-    """
-    blob = f"{nome or ''} {cargo_pdf or ''}".upper()
-    if "SITUAÇÃO" in blob and "TRABALH" in blob:
-        return True
-    return None
-
-
 def gpt_extract_verbas(block: str, model: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """
     Fallback GPT: extrair valores das verbas 8781 e 981 do TEXTO do bloco.
-    Só chama se você ativar no sidebar.
+    Usa Chat Completions com JSON mode (mais compatível no Streamlit Cloud).
     """
     try:
         from openai import OpenAI
@@ -146,37 +132,101 @@ def gpt_extract_verbas(block: str, model: str) -> Tuple[Optional[float], Optiona
         return None, None, "OPENAI_API_KEY não definido"
 
     client = OpenAI(api_key=api_key)
+
     system = (
         "Você extrai valores monetários de verbas em um texto de folha. "
-        "Extraia APENAS se estiver explícito. Se não encontrar, retorne null."
+        "Extraia APENAS se estiver explícito. Se não encontrar, retorne null. "
+        "Não invente valores."
     )
     user = (
         "Do texto a seguir, extraia os valores das verbas:\n"
-        "- 8781 (salário contratual)\n"
-        "- 981 (desc adiantamento salarial)\n\n"
-        "Retorne JSON: {\"v8781\": number|null, \"v981\": number|null, \"evidence\": string|null}\n\n"
+        "- 8781 (salário contratual) -> valor monetário\n"
+        "- 981 (desc adiantamento salarial) -> valor monetário\n\n"
+        "Retorne SOMENTE JSON no formato:\n"
+        "{\"v8781\": number|null, \"v981\": number|null, \"evidence\": string|null}\n\n"
         f"TEXTO:\n{block}"
     )
 
-    # resposta em JSON simples
-    resp = client.responses.create(
-        model=model,
-        input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        response_format={"type": "json_object"},
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+
+        v8781 = data.get("v8781", None)
+        v981 = data.get("v981", None)
+        ev = data.get("evidence", None)
+
+        try:
+            v8781 = float(v8781) if v8781 is not None else None
+        except Exception:
+            v8781 = None
+
+        try:
+            v981 = float(v981) if v981 is not None else None
+        except Exception:
+            v981 = None
+
+        return v8781, v981, ev
+
+    except Exception as e:
+        return None, None, f"erro GPT: {e}"
+
+
+def infer_ativo_from_pdf_block(block: Optional[str]) -> Optional[bool]:
+    """
+    Inferir ATIVO pelo texto do bloco:
+    - se existir 'Situação: Trabalhando' (ou variações) => ATIVO
+    """
+    if not block:
+        return None
+    up = block.upper()
+    if "SITUAÇÃO" in up and ("TRABALHANDO" in up or "TRABALH" in up):
+        return True
+    return None
+
+
+def detect_status_col(df: pd.DataFrame) -> Optional[str]:
+    cols = [str(c).strip().upper() for c in df.columns]
+    for cand in ["STATUS", "SITUAÇÃO", "SITUACAO", "ATIVO"]:
+        if cand in cols:
+            return next(c for c in df.columns if str(c).strip().upper() == cand)
+    return None
+
+
+def is_ativo_from_xlsx(df: pd.DataFrame, cpf: Optional[str], nome: Optional[str]) -> Optional[bool]:
+    status_col = detect_status_col(df)
+    if not status_col:
+        return None
+
+    cpf_col = next((c for c in df.columns if str(c).strip().upper() == "CPF"), None)
+    nome_col = next(
+        (c for c in df.columns if str(c).strip().upper() in ["NOME", "COLABORADOR", "FUNCIONARIO", "FUNCIONÁRIO"]),
+        None,
     )
-    data = resp.output_parsed or {}
-    v8781 = data.get("v8781", None)
-    v981 = data.get("v981", None)
-    ev = data.get("evidence", None)
-    try:
-        v8781 = float(v8781) if v8781 is not None else None
-    except Exception:
-        v8781 = None
-    try:
-        v981 = float(v981) if v981 is not None else None
-    except Exception:
-        v981 = None
-    return v8781, v981, ev
+
+    if cpf_col and cpf:
+        hit = df[df[cpf_col].astype(str).str.strip() == str(cpf).strip()]
+        if len(hit) >= 1:
+            v = str(hit.iloc[0][status_col]).upper()
+            return ("ATIV" in v) or (v in ["SIM", "S", "TRUE", "1"])
+
+    if nome_col and nome:
+        nn = re.sub(r"\s+", " ", str(nome)).strip().upper()
+        ser = df[nome_col].astype(str).map(lambda x: re.sub(r"\s+", " ", str(x)).strip().upper())
+        hit = df[ser == nn]
+        if len(hit) >= 1:
+            v = str(hit.iloc[0][status_col]).upper()
+            return ("ATIV" in v) or (v in ["SIM", "S", "TRUE", "1"])
+
+    return None
 
 
 # -----------------------------
@@ -192,7 +242,7 @@ with col2:
     st.title(APP_TITLE)
     st.caption(
         "Regra geral: **Valor a pagar = Bruto(planilha) − Líquido(PDF)**.\n"
-        "Regra especial: se **(Líquido≈0 OU existir verba 981)** e colaborador **ATIVO**, então:\n"
+        "Regra especial (casos tipo Alana): se **(Líquido ≈ 0 OU existir verba 981)** e colaborador **ATIVO**, então:\n"
         "**Valor a pagar = Bruto(planilha) − verba 8781 − verba 981**"
     )
 
@@ -200,10 +250,14 @@ st.divider()
 
 st.sidebar.header("Configurações")
 use_gpt = st.sidebar.toggle("Usar GPT (fallback) para extrair 8781/981 quando regex falhar", value=True)
-# modelo mais forte por padrão (você pediu)
 openai_model = st.sidebar.text_input("Modelo OpenAI", value=os.getenv("OPENAI_MODEL", "gpt-4.1"))
 empresa_nome = st.sidebar.text_input("Nome da empresa no recibo", value="Contare")
-limiar_zero = st.sidebar.number_input("Limiar p/ considerar líquido como 'zerado' (R$)", value=float(EPS_ZERO), min_value=0.0, step=1.0)
+limiar_zero = st.sidebar.number_input(
+    "Limiar p/ considerar líquido como 'zerado' (R$)",
+    value=float(DEFAULT_LIMIAR_ZERO),
+    min_value=0.0,
+    step=1.0,
+)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Se ativar GPT, defina OPENAI_API_KEY no ambiente.")
@@ -224,16 +278,15 @@ xlsx_path = workdir / "salario_real.xlsx"
 pdf_path.write_bytes(pdf_file.getbuffer())
 xlsx_path.write_bytes(xlsx_file.getbuffer())
 
-
 if st.button("Processar", type="primary"):
     with st.spinner("Extraindo dados do PDF..."):
+        # parser base (rápido); GPT aqui fica apenas para verbas 8781/981 se regex falhar
         extracao = parse_pdf_with_fallback(
             str(pdf_path),
-            use_gpt_fallback=False,  # aqui deixamos o parser rápido; GPT será para verbas 8781/981
+            use_gpt_fallback=False,
             openai_model=openai_model,
         )
 
-    # texto completo do PDF para localizar blocos por CPF (inteligente p/ verbas)
     with st.spinner("Carregando texto do PDF para tratar verbas 8781/981..."):
         full_text = extract_full_text(str(pdf_path))
 
@@ -243,40 +296,21 @@ if st.button("Processar", type="primary"):
         final_rows: list[dict[str, Any]] = []
         pendencias: list[dict[str, Any]] = []
 
-        # tentar achar coluna STATUS na planilha, se existir
-        status_col = None
-        for cand in ["STATUS", "SITUAÇÃO", "SITUACAO", "ATIVO"]:
-            if cand in [str(c).strip().upper() for c in df_sal.columns]:
-                status_col = next(c for c in df_sal.columns if str(c).strip().upper() == cand)
-                break
-
-        def is_ativo_from_xlsx(cpf: Optional[str], nome: Optional[str]) -> Optional[bool]:
-            if not status_col:
-                return None
-            # tenta achar por CPF ou nome exato
-            cpf_col = next((c for c in df_sal.columns if str(c).strip().upper() == "CPF"), None)
-            nome_col = next((c for c in df_sal.columns if str(c).strip().upper() in ["NOME", "COLABORADOR", "FUNCIONARIO", "FUNCIONÁRIO"]), None)
-
-            if cpf_col and cpf:
-                hit = df_sal[df_sal[cpf_col].astype(str).str.strip() == str(cpf).strip()]
-                if len(hit) >= 1:
-                    v = str(hit.iloc[0][status_col]).upper()
-                    return ("ATIV" in v) or (v in ["SIM", "S", "TRUE", "1"])
-            if nome_col and nome:
-                nn = re.sub(r"\s+", " ", str(nome)).strip().upper()
-                ser = df_sal[nome_col].astype(str).map(lambda x: re.sub(r"\s+", " ", str(x)).strip().upper())
-                hit = df_sal[ser == nn]
-                if len(hit) >= 1:
-                    v = str(hit.iloc[0][status_col]).upper()
-                    return ("ATIV" in v) or (v in ["SIM", "S", "TRUE", "1"])
-            return None
-
         for c in extracao.colaboradores:
             competencia = c.competencia or extracao.competencia_global
 
             bruto_planilha, match_status = find_salario_real(df_sal, c.cpf, c.nome)
             liquido_pdf = safe_float(c.liquido)
 
+            # localizar bloco do colaborador no PDF (por CPF)
+            block = find_block_by_cpf(full_text, c.cpf) if c.cpf else None
+
+            # status ativo: prefere planilha; fallback pelo bloco do PDF
+            ativo_xlsx = is_ativo_from_xlsx(df_sal, c.cpf, c.nome)
+            ativo_pdf = infer_ativo_from_pdf_block(block)
+            is_ativo = ativo_xlsx if ativo_xlsx is not None else ativo_pdf
+
+            # cargos
             familia = infer_familia(c.cargo_pdf)
             nivel = nivel_por_salario(bruto_planilha) if bruto_planilha is not None else None
             cargo_plano = cargo_final(nivel, familia)
@@ -287,15 +321,10 @@ if st.button("Processar", type="primary"):
             evidencia_liquido = getattr(c, "evidence", None).liquido if getattr(c, "evidence", None) else None
             evidencia_cpf = getattr(c, "evidence", None).cpf if getattr(c, "evidence", None) else None
 
-            ativo_xlsx = is_ativo_from_xlsx(c.cpf, c.nome)
-            ativo_pdf = infer_ativo_from_pdf_fields(c.nome, c.cargo_pdf)
-            is_ativo = ativo_xlsx if ativo_xlsx is not None else ativo_pdf  # fallback do PDF
-
-            # Extrair verbas 8781/981 diretamente do PDF (bloco do colaborador)
-            block = find_block_by_cpf(full_text, c.cpf) if c.cpf else None
+            # extrair verbas 8781/981 do bloco
             v8781, v981, ev_verbas = extract_verbas_8781_981_from_block(block or "")
 
-            # GPT fallback para verbas quando regex falhar
+            # GPT fallback (se ativado) quando regex falhar
             if use_gpt and block and (v8781 is None or v981 is None):
                 gv8781, gv981, gev = gpt_extract_verbas(block, model=openai_model)
                 v8781 = v8781 if v8781 is not None else gv8781
@@ -317,7 +346,7 @@ if st.button("Processar", type="primary"):
                 notas.append("CPF ausente/ambíguo (recibo pode ser gerado por matrícula)")
 
             # --------
-            # REGRA (PADRÃO vs ESPECIAL)
+            # REGRA PADRÃO vs ESPECIAL
             # gatilho especial:
             #   - líquido <= limiar_zero OU existe verba 981
             #   - e colaborador ATIVO
@@ -334,7 +363,6 @@ if st.button("Processar", type="primary"):
                     if v8781 is None or v981 is None:
                         status = "REVISAR" if status == "OK" else status
                         notas.append("regra especial acionada, mas 8781/981 não foram extraídas (verificar bloco/PDF).")
-                        # fallback: não inventa — usa regra padrão
                         diferenca = float(bruto_planilha) - float(liquido_pdf)
                         valor_a_pagar = max(diferenca, 0.0)
                     else:
@@ -347,6 +375,11 @@ if st.button("Processar", type="primary"):
                 if diferenca is not None and diferenca < 0:
                     status = "INCONSISTENTE"
                     notas.append("diferença negativa (verifique dados).")
+
+            # gate de revisão por confiança do parser
+            if getattr(c, "confidence", None) and c.confidence.liquido < 0.85:
+                status = "REVISAR" if status == "OK" else status
+                notas.append("confidence do líquido baixa")
 
             row = {
                 "competencia_global": extracao.competencia_global,
@@ -363,7 +396,7 @@ if st.button("Processar", type="primary"):
                 "nivel": nivel,
                 "cargo_final": cargo_plano,
 
-                # compatível com recibo
+                # campo esperado pelo recibo
                 "liquido_folha": liquido_pdf,
 
                 "salario_real_bruto_planilha": bruto_planilha,
@@ -410,7 +443,11 @@ if final_rows:
 
     with colA:
         if st.button("Gerar Excel (Consolidado)"):
-            export_consolidado_xlsx(final_rows, str(out_xlsx), logo_path=LOGO_PATH if Path(LOGO_PATH).exists() else None)
+            export_consolidado_xlsx(
+                st.session_state["final_rows"],
+                str(out_xlsx),
+                logo_path=LOGO_PATH if Path(LOGO_PATH).exists() else None,
+            )
             st.success("Excel consolidado gerado.")
             st.download_button(
                 "Baixar Excel (Consolidado)",
@@ -421,7 +458,11 @@ if final_rows:
 
     with colB:
         if st.button("Gerar Excel (Conferência)"):
-            export_consolidado_xlsx(conf_rows, str(out_conf_xlsx), logo_path=LOGO_PATH if Path(LOGO_PATH).exists() else None)
+            export_consolidado_xlsx(
+                conf_rows,
+                str(out_conf_xlsx),
+                logo_path=LOGO_PATH if Path(LOGO_PATH).exists() else None,
+            )
             st.success("Excel de conferência gerado.")
             st.download_button(
                 "Baixar Excel (Conferência)",
@@ -433,7 +474,10 @@ if final_rows:
     with colC:
         if st.button("Gerar ZIP de Recibos PDF"):
             out_receipts_dir.mkdir(parents=True, exist_ok=True)
-            eligible = [r for r in final_rows if r.get("valor_a_pagar") is not None and float(r.get("valor_a_pagar")) > 0]
+            eligible = [
+                r for r in st.session_state["final_rows"]
+                if r.get("valor_a_pagar") is not None and float(r.get("valor_a_pagar")) > 0
+            ]
             pdfs = generate_all_receipts(
                 eligible,
                 str(out_receipts_dir),
