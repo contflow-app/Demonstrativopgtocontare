@@ -1,0 +1,42 @@
+[
+  {
+    "nivel": "Auxiliar I",
+    "ref": 1700.0
+  },
+  {
+    "nivel": "Auxiliar II",
+    "ref": 1800.0
+  },
+  {
+    "nivel": "Assistente I",
+    "ref": 2100.0
+  },
+  {
+    "nivel": "Assistente II",
+    "ref": 2300.0
+  },
+  {
+    "nivel": "Analista Júnior",
+    "ref": 2600.0
+  },
+  {
+    "nivel": "Analista Pleno",
+    "ref": 2900.0
+  },
+  {
+    "nivel": "Analista Sênior",
+    "ref": 3400.0
+  },
+  {
+    "nivel": "Coordenador I",
+    "ref": 4000.0
+  },
+  {
+    "nivel": "Coordenador II",
+    "ref": 5000.0
+  },
+  {
+    "nivel": "Coordenador Sênior",
+    "ref": 6000.0
+  }
+]
