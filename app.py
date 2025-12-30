@@ -4,7 +4,7 @@ import os
 import re
 import zipfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
@@ -20,6 +20,24 @@ LOGO_PATH = str(Path(__file__).parent / "assets" / "logo.png")
 
 
 # -----------------------------
+# Normalizações
+# -----------------------------
+def cpf_digits(cpf: Optional[str]) -> str:
+    if not cpf:
+        return ""
+    return re.sub(r"\D", "", str(cpf))
+
+
+def safe_float(x) -> Optional[float]:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+# -----------------------------
 # Helpers (CSV de eventos/pagamentos em folha)
 # -----------------------------
 def _detect_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
@@ -27,6 +45,7 @@ def _detect_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     for cand in candidates:
         if cand.upper() in cols:
             return cols[cand.upper()]
+    # fuzzy: contains
     for uc, orig in cols.items():
         for cand in candidates:
             if cand.upper() in uc:
@@ -35,6 +54,7 @@ def _detect_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
 
 
 def _to_float_series(s: pd.Series) -> pd.Series:
+    # converter pt-BR "1.234,56" para float
     def conv(v):
         if pd.isna(v):
             return None
@@ -53,57 +73,61 @@ def _to_float_series(s: pd.Series) -> pd.Series:
     return s.map(conv)
 
 
-def load_eventos_csv(file_bytes: bytes) -> Tuple[pd.DataFrame, dict]:
+def load_eventos_csv(file_bytes: bytes, keywords_regex: str) -> Tuple[pd.DataFrame, Dict[str, float], Dict[str, float]]:
+    """
+    Lê CSV de eventos da folha e cria mapas:
+      - pago_por_cpf[cpf_digits] = soma_valores_pagamento
+      - pago_por_matricula[matricula] = soma_valores_pagamento
+    """
+    df = None
     for sep in [",", ";", "\t"]:
         try:
             df = pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=sep, dtype=str, encoding_errors="ignore")
-            if df.shape[1] >= 2:
+            if df is not None and df.shape[1] >= 2:
                 break
         except Exception:
             df = None
+
     if df is None:
-        raise ValueError("Não foi possível ler o CSV (tente exportar como CSV separado por ';' ou ',').")
+        raise ValueError("Não foi possível ler o CSV (tente exportar separado por ';' ou ',').")
 
     col_cpf = _detect_column(df, ["CPF", "CPF FUNCIONARIO", "CPF FUNCIONÁRIO"])
     col_matricula = _detect_column(df, ["MATRICULA", "MATRÍCULA", "EMPR", "EMPREGADO", "CODIGO", "CÓDIGO"])
-    col_desc = _detect_column(df, ["DESCRICAO", "DESCRIÇÃO", "HISTORICO", "HISTÓRICO", "EVENTO", "RUBRICA", "RUBRICA/VERBA"])
+    col_desc = _detect_column(df, ["DESCRICAO", "DESCRIÇÃO", "HISTORICO", "HISTÓRICO", "EVENTO", "RUBRICA", "VERBA"])
     col_val = _detect_column(df, ["VALOR", "VALOR_R$", "VALOR R$", "IMPORTANCIA", "IMPORTÂNCIA", "VLR"])
 
     if col_desc is None or col_val is None:
-        raise ValueError("No CSV de eventos não consegui identificar colunas de DESCRIÇÃO/EVENTO e VALOR.")
+        raise ValueError("No CSV não identifiquei colunas de DESCRIÇÃO/EVENTO e VALOR.")
 
     df_norm = df.copy()
-    df_norm["CPF_NORM"] = df_norm[col_cpf].astype(str).str.strip() if col_cpf else None
-    df_norm["MATRICULA_NORM"] = df_norm[col_matricula].astype(str).str.strip() if col_matricula else None
+    df_norm["CPF_DIGITS"] = df_norm[col_cpf].map(cpf_digits) if col_cpf else ""
+    df_norm["MATRICULA_NORM"] = df_norm[col_matricula].astype(str).str.strip() if col_matricula else ""
     df_norm["DESC_UP"] = df_norm[col_desc].astype(str).str.upper().str.strip()
     df_norm["VALOR_NUM"] = _to_float_series(df_norm[col_val])
 
-    re_paid = re.compile(r"(ADIANT|ADTO|VALE|ANTECIP|PAGAMENTO|PIX|TRANSFER)", re.IGNORECASE)
+    re_paid = re.compile(keywords_regex, re.IGNORECASE)
 
     df_paid = df_norm[df_norm["DESC_UP"].map(lambda x: bool(re_paid.search(x or "")))].copy()
     df_paid = df_paid[df_paid["VALOR_NUM"].notna()]
 
-    pagamentos_map: dict = {}
-
-    def add_amount(key: str, amount: float):
-        if not key:
-            return
-        pagamentos_map.setdefault(key, {"adiantamento": 0.0, "total_pago_folha": 0.0})
-        pagamentos_map[key]["adiantamento"] += float(amount)
-        pagamentos_map[key]["total_pago_folha"] += float(amount)
+    pago_por_cpf: Dict[str, float] = {}
+    pago_por_matricula: Dict[str, float] = {}
 
     for _, r in df_paid.iterrows():
         amt = float(r["VALOR_NUM"])
+        # Considera somente valores positivos como "pagamento"
         if amt <= 0:
             continue
-        cpf = (r.get("CPF_NORM") or "").strip()
-        mat = (r.get("MATRICULA_NORM") or "").strip()
-        if cpf:
-            add_amount(cpf, amt)
-        elif mat:
-            add_amount(mat, amt)
 
-    return df_norm, pagamentos_map
+        cpf_d = (r.get("CPF_DIGITS") or "").strip()
+        mat = (r.get("MATRICULA_NORM") or "").strip()
+
+        if cpf_d:
+            pago_por_cpf[cpf_d] = pago_por_cpf.get(cpf_d, 0.0) + amt
+        elif mat:
+            pago_por_matricula[mat] = pago_por_matricula.get(mat, 0.0) + amt
+
+    return df_norm, pago_por_cpf, pago_por_matricula
 
 
 # -----------------------------
@@ -118,8 +142,7 @@ with col1:
 with col2:
     st.title(APP_TITLE)
     st.caption(
-        "Regra padrão: **Valor a pagar = Bruto (planilha Excel) − Líquido (folha/PDF)**. "
-        "Quando o **líquido do PDF for 0,00**, o app pode somar **pagamentos em folha** (ex.: adiantamento) via CSV de eventos."
+        "Regra: **Valor a pagar = Bruto (planilha Excel) − (Líquido do PDF + pagamentos em folha do CSV quando líquido=0,00)**"
     )
 
 st.divider()
@@ -129,15 +152,20 @@ use_gpt = st.sidebar.toggle("Usar GPT como fallback (se campos críticos faltare
 openai_model = st.sidebar.text_input("Modelo OpenAI", value=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
 empresa_nome = st.sidebar.text_input("Nome da empresa no recibo", value="Contare")
 
-st.sidebar.subheader("Regra de cálculo")
-st.sidebar.write("**Valor a pagar = Bruto (planilha) − (Líquido do PDF + Pagamentos em folha do CSV [opcional])**")
+st.sidebar.subheader("Tratativa de líquido zerado")
+keywords = st.sidebar.text_input(
+    "Palavras-chave (CSV) para reconhecer pagamentos em folha (regex)",
+    value=r"(ADIANT|ADTO|VALE|ANTECIP|ANTECIPA|PAGAMENTO|TRANSFER|PIX)",
+)
+st.sidebar.caption("Dica: ajuste aqui para bater com o nome das rubricas/verb as do seu sistema.")
+
 st.sidebar.markdown("---")
 st.sidebar.caption("Se ativar GPT, defina OPENAI_API_KEY no ambiente.")
 
 pdf_file = st.file_uploader("1) Suba o PDF do Extrato Mensal", type=["pdf"])
 xlsx_file = st.file_uploader("2) Suba a planilha de salário real (XLSX)", type=["xlsx"])
 csv_file = st.file_uploader(
-    "3) (Opcional) Suba o CSV de eventos/pagamentos em folha (adiantamento/vale etc.)",
+    "3) (Opcional) CSV de eventos/pagamentos em folha (adiantamento/vale etc.)",
     type=["csv"],
 )
 
@@ -154,14 +182,14 @@ xlsx_path = workdir / "salario_real.xlsx"
 pdf_path.write_bytes(pdf_file.getbuffer())
 xlsx_path.write_bytes(xlsx_file.getbuffer())
 
-pagamentos_map = {}
-df_eventos_norm = None
+pago_por_cpf: Dict[str, float] = {}
+pago_por_matricula: Dict[str, float] = {}
 if csv_file:
     try:
-        df_eventos_norm, pagamentos_map = load_eventos_csv(csv_file.getbuffer().tobytes())
-        st.success("CSV de eventos carregado. Vou usar pagamentos em folha como reforço quando o líquido do PDF for 0,00.")
+        _, pago_por_cpf, pago_por_matricula = load_eventos_csv(csv_file.getbuffer().tobytes(), keywords_regex=keywords)
+        st.success("CSV carregado. Vou somar pagamentos do CSV quando o líquido do PDF for 0,00.")
     except Exception as e:
-        st.warning(f"Não consegui usar o CSV de eventos: {e}. Vou seguir só com PDF+XLSX.")
+        st.warning(f"Não consegui usar o CSV: {e}. Vou seguir só com PDF+XLSX.")
 
 if st.button("Processar", type="primary"):
     with st.spinner("Extraindo dados do PDF..."):
@@ -171,7 +199,7 @@ if st.button("Processar", type="primary"):
             openai_model=openai_model,
         )
 
-    with st.spinner("Cruzando com planilha, atribuindo cargos e calculando valor a pagar..."):
+    with st.spinner("Cruzando com planilha, atribuindo cargos e calculando..."):
         df_sal = load_salario_real_xlsx(str(xlsx_path))
         final_rows = []
         pendencias = []
@@ -179,9 +207,13 @@ if st.button("Processar", type="primary"):
         for c in extracao.colaboradores:
             competencia = c.competencia or extracao.competencia_global
 
+            # alvo = bruto planilha
             salario_real_bruto, match_status = find_salario_real(df_sal, c.cpf, c.nome)
-            liquido_folha = c.liquido
 
+            # líquido do PDF
+            liquido_pdf = safe_float(c.liquido)
+
+            # cargos
             familia = infer_familia(c.cargo_pdf)
             nivel = nivel_por_salario(salario_real_bruto) if salario_real_bruto is not None else None
             cargo_plano = cargo_final(nivel, familia)
@@ -192,50 +224,51 @@ if st.button("Processar", type="primary"):
             evidencia_liquido = getattr(c, "evidence", None).liquido if getattr(c, "evidence", None) else None
             evidencia_cpf = getattr(c, "evidence", None).cpf if getattr(c, "evidence", None) else None
 
-            pago_folha_csv = 0.0
-            if pagamentos_map:
-                key_cpf = (c.cpf or "").strip()
-                key_mat = (c.matricula or "").strip()
-                if key_cpf and key_cpf in pagamentos_map:
-                    pago_folha_csv = float(pagamentos_map[key_cpf].get("total_pago_folha", 0.0) or 0.0)
-                elif key_mat and key_mat in pagamentos_map:
-                    pago_folha_csv = float(pagamentos_map[key_mat].get("total_pago_folha", 0.0) or 0.0)
+            # pagamentos via CSV (somente quando liquido=0,00)
+            pago_csv = 0.0
+            if (liquido_pdf is not None) and (abs(liquido_pdf) < 0.00001) and (pago_por_cpf or pago_por_matricula):
+                cpf_d = cpf_digits(c.cpf)
+                if cpf_d and cpf_d in pago_por_cpf:
+                    pago_csv = float(pago_por_cpf.get(cpf_d, 0.0))
+                elif c.matricula and str(c.matricula).strip() in pago_por_matricula:
+                    pago_csv = float(pago_por_matricula.get(str(c.matricula).strip(), 0.0))
 
-            if liquido_folha is None:
+            # pendências mínimas
+            if liquido_pdf is None:
                 status = "PENDENTE"
                 notas.append("líquido não extraído do PDF")
             else:
-                if float(liquido_folha) == 0.0:
-                    if pagamentos_map and pago_folha_csv > 0:
-                        notas.append(f"Líquido = 0,00; somando pagamentos em folha do CSV: {pago_folha_csv:.2f}")
+                if abs(liquido_pdf) < 0.00001:
+                    if pago_csv > 0:
+                        notas.append(f"Líquido=0,00; somando pagamentos do CSV: {pago_csv:.2f}")
                     else:
-                        notas.append("Líquido na folha = 0,00 (confirmado no PDF). Se houve adiantamento/vale, envie o CSV de eventos.")
+                        notas.append("Líquido=0,00 (confirmado no PDF). Se houve adiantamento/vale, ajuste palavras-chave ou CSV.")
 
             if salario_real_bruto is None:
                 status = "PENDENTE" if status == "OK" else status
                 notas.append(f"salário real bruto não encontrado (match: {match_status})")
 
-            if c.cpf is None:
+            if not c.cpf:
                 status = "REVISAR" if status == "OK" else status
                 notas.append("CPF ausente/ambíguo (recibo pode ser gerado por matrícula)")
 
+            # cálculo final:
+            total_pago = None
             diferenca = None
             valor_a_pagar = None
-            total_pago_folha = None
 
-            if salario_real_bruto is not None and liquido_folha is not None:
-                base_pago = float(liquido_folha)
+            if salario_real_bruto is not None and liquido_pdf is not None:
+                total_pago = float(liquido_pdf)
+                # tratativa específica: se líquido do PDF = 0,00, somar pagamentos do CSV
+                if abs(liquido_pdf) < 0.00001 and pago_csv > 0:
+                    total_pago += float(pago_csv)
 
-                if float(liquido_folha) == 0.0 and pagamentos_map and pago_folha_csv > 0:
-                    base_pago += float(pago_folha_csv)
-
-                total_pago_folha = base_pago
-                diferenca = float(salario_real_bruto) - float(total_pago_folha)
+                diferenca = float(salario_real_bruto) - float(total_pago)
                 valor_a_pagar = max(diferenca, 0.0)
 
                 if diferenca < 0:
                     status = "INCONSISTENTE"
-                    notas.append("diferença negativa (bruto planilha < total pago em folha)")
+                    notas.append("diferença negativa (bruto planilha < total pago reconhecido)")
 
             if getattr(c, "confidence", None) and c.confidence.liquido < 0.85:
                 status = "REVISAR" if status == "OK" else status
@@ -244,17 +277,21 @@ if st.button("Processar", type="primary"):
             row = {
                 "competencia_global": extracao.competencia_global,
                 "competencia": competencia,
+
                 "matricula": c.matricula,
                 "nome": c.nome,
                 "cpf": c.cpf,
+
                 "cargo_pdf": c.cargo_pdf,
                 "familia": familia,
                 "nivel": nivel,
                 "cargo_final": cargo_plano,
 
-                "liquido_folha_pdf": liquido_folha,
-                "pagamentos_folha_csv": float(pago_folha_csv) if pagamentos_map else None,
-                "total_pago_folha": total_pago_folha,
+                # IMPORTANTE: manter estes nomes para o recibo achar:
+                "liquido_folha": liquido_pdf,          # <— receipts_pdf usa este
+                "liquido_folha_pdf": liquido_pdf,      # <— para seu controle
+                "pagamentos_folha_csv": pago_csv if (pago_por_cpf or pago_por_matricula) else None,
+                "total_pago_folha": total_pago,
 
                 "salario_real_bruto_planilha": salario_real_bruto,
                 "diferenca_calculada": diferenca,
@@ -282,14 +319,12 @@ if final_rows:
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Pendências / Revisar")
-    dfp = pd.DataFrame(st.session_state.get("pendencias", []))
+    conf_rows = st.session_state.get("pendencias", [])
+    dfp = pd.DataFrame(conf_rows)
     st.dataframe(dfp, use_container_width=True, hide_index=True)
 
-    # RELATÓRIO DE CONFERÊNCIA (Excel) = somente itens com status != OK
-    conf_rows = st.session_state.get("pendencias", [])
-    out_conf_xlsx = workdir / "relatorio_conferencia.xlsx"
-
     out_xlsx = workdir / "demonstrativo_complemento.xlsx"
+    out_conf_xlsx = workdir / "relatorio_conferencia.xlsx"
     out_receipts_dir = workdir / "recibos"
     out_zip = workdir / "recibos_pdf.zip"
 
@@ -329,8 +364,7 @@ if final_rows:
         if st.button("Gerar ZIP de Recibos PDF"):
             out_receipts_dir.mkdir(parents=True, exist_ok=True)
             eligible = [
-                r
-                for r in final_rows
+                r for r in final_rows
                 if r.get("valor_a_pagar") is not None and float(r.get("valor_a_pagar")) > 0
             ]
             pdfs = generate_all_receipts(
